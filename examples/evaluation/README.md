@@ -7,11 +7,7 @@ After you have trained an LCM, the checkpoint will be saved in a folder under th
 Since an LCM expects input data in sentence level, we need to preprocess the evaluation datasets accordingly. This includes parsing the raw content and
 splitting  texts into sentences, then embedding them into vectors using a Sonar encoder.
 
-The example below shows how we prepare the data for CNN Dailymail. We load the dataset from Huggingface using [`datasets` API](https://huggingface.co/docs/datasets/en/index). The sentence splitting is done using [wtpsplit](https://github.com/segment-any-text/wtpsplit). First, we install necessary libraries:
-
-```shell
-python -m pip install datasets wtpsplit
-```
+The example below shows how we prepare the data for CNN Dailymail. We load the dataset from Huggingface using [`datasets` API](https://huggingface.co/docs/datasets/en/index). The sentence splitting is done using [wtpsplit](https://github.com/segment-any-text/wtpsplit). Make sure to specify `--extra data` in installing the project to include these libraries.
 
 All processing logic is implemented in the file `prepare_evaluation_data.py`, as described below.
 
@@ -19,9 +15,9 @@ All processing logic is implemented in the file `prepare_evaluation_data.py`, as
 Next, we download and parse the content (source text and summaries), saving different splits into JSON format
 
 ```shell
-python prepare_evaluation_data.py prepare_data \
+uv run --extra data prepare_evaluation_data.py prepare_data \
     --dataset_name=cnn_dailymail \
-    --output_dir=jsonl_dataset/cnn_dailymail \
+    --output_dir=jsonl_dataset \
     --source_text_column=article \
     --target_text_column=highlights \
     --version=3.0.0 \
@@ -31,6 +27,8 @@ python prepare_evaluation_data.py prepare_data \
 
 Explain: In the above script, `cnn_dailymail` and `3.0.0` is the name and configuration of the dataset as available in HuggingFace `datasets`, `article` and `highlights` are source and summary columns. The `prompt_prefix` and `prompt_suffix` are optional arguments, if specified they will be prepended and appended to each source text to form the complete prompt. These arguments are useful if you want to embed the prompts into the dataset, and let them process all at once together with the text. Alternatively, we can specify them at later phase, when we evaluate the model (in which case the model will process the prompts on the fly)
 
+> **_NOTE:_**  When `prompt_prefix` or `prompt_suffix` are specified, the dataset schema will change, i.e. the columns are renamed to "prompt" for input and "answer" for output. This is to indicate that we are handling the "processed" dataset and not the original one.
+
 The output will be stored in different files `[split].jsonl` under the directory `output_dir`. 
 
 
@@ -39,13 +37,29 @@ The output will be stored in different files `[split].jsonl` under the directory
 To perform sentence splitting and sonar embedding for each split, run the following command:
 
 ```shell
-python prepare_evaluation_data.py embed \
+uv run --extra data prepare_evaluation_data.py embed \
     --input_path=jsonl_dataset/cnn_dailymail/test.jsonl \
+    --source_text_column=prompt \
+    --target_text_column=answer \
     --output_dir=parquet_dataset/cnn_dailymail \
     --lang=eng_Latn \
-    --mode=slurm \
+    --mode=local \
     --log_dir=/tmp/logs/embed_cnndm
 ```
+
+Depending on your machine, this might take some time. Alternatively, you can try to run in your SLURM cluster with the argmnent `--mode=slurm --shards=NO_OF_PARALLEL_JOBS`. This requires changing your SLURM config accordingly. We use [submitit](https://github.com/facebookincubator/submitit) to configure the job launcher. Here is the relevant excerpt in the script:
+
+```python
+launcher = Launcher(
+      cache=None,
+      config_dump_dir=Path(log_dir) / "conf",
+      log_folder=Path(log_dir) / "logs",
+      cluster=mode,
+      update_parameters={"partition": "your_slurm_partition"},
+  )
+  _ = await launcher.schedule(inst_stopes_module)
+```
+
 
 
 ## Step 2: Choose the predictor for evaluation
@@ -92,12 +106,16 @@ uv run torchrun --standalone --nnodes=1 --nproc-per-node=1 -m lcm.evaluation \
   --task_args '{"max_gen_len": 200}' \
   --dataset_dir jsonl_dataset/cnn_dailymail \
   --data_loading.batch_size 16 \
+  --dataset.soure_text_column prompt \
+  --dataset.source_target_column answer \
   --dump_dir output_results
 ```
 
 In the example above, we load the model "meta-llama/Llama-3.1-8B-Instruct" as [specified](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) in HuggingFace, evaluate it on the CNN dailymail in which we process using the `prepare_evaluation_data.py` script as in Step 1.1, and store the results in the folder specified via `dump_dir`. The argument `dataset_dir` refers to the value of the argument `output_dir` in Step 1.1.
 
-You can also customize the prompt used to evaluate the LLM for each evaluation run. To do this, instead of specifying the `prompt_prefix` and `prompt_suffix` when preparing the data (as shown in the example in Section 1.1), we specify `dataset.source_prefix_text` and `dataset.source_suffix_text` during the evaluation run:
+In some cases, the model requires authentication token to evaluate. You can obtain them in HuggingGface (see [User Access Tokens](https://huggingface.co/docs/hub/en/security-tokens)), then add the parameter `--use_auth_token [YOUR TOKEN]` to the CLI command.
+
+In the above example, we need to provide the `source_text_column` and `source_target_column` parameters, because in Step 1, we inject the prompts direcly to the dataset and renamed the columns accordingly (to differentiate with "original" datasets).  You can also skip this part and customize the prompt for each for each evaluation run. To do this, instead of specifying the `prompt_prefix` and `prompt_suffix` when preparing the data (as shown in the example in Section 1.1), we specify `dataset.source_prefix_text` and `dataset.source_suffix_text` during the evaluation run:
 
 ```shell
 uv run torchrun --standalone --nnodes=1 --nproc-per-node=1 -m lcm.evaluation \
@@ -112,6 +130,8 @@ uv run torchrun --standalone --nnodes=1 --nproc-per-node=1 -m lcm.evaluation \
   --dataset.source_suffix_text "\n[Text End]" \
   --dump_dir output_results
 ```
+
+> **_NOTE:_** the missing parameters `source_text_column` and `target_text_column` and the new parameters `source_prefix_text`, `target_prefix_text` are becase we do not modify the column schema. Therefore, the original text columns ("article", "highlights") are kept and not specified in the CLI.
 
 It is also possible to provide the prompt from a YAML file. This is handy when you have to engineer the prompts carefully and have a very long detailed text. We provide one example prompt in the file [instruction.yaml](./instruction.yaml). The example command is:
 
@@ -141,6 +161,10 @@ uv run torchrun --standalone --nnodes=1 --nproc-per-node=1 -m lcm.evaluation \
   --tasks lcm_generation \
   --task_args '{"max_gen_len": 200}' \
   --dataset.parquet_path parquet_dataset/cnn_dailymail \
+  --dataset.source_column prompt_sentences_sonar_emb \
+  --dataset.source_text_column prompt_sentences \
+  --dataset.target_column answer_sentences_sonar_emb \
+  --dataset.target_text_column answer_sentences \
   --data_loading.batch_size 16 \
   --dump_dir output_results
 ```
@@ -158,13 +182,12 @@ Similar to LLM evaluation, it is possible to specify the prompt prefix and suffi
 | `data_loading.batch_size`   | Loading and evaluate data in batch. By default `batch_size=10`   |
 | `dataset_dir` | The directory consists of different JSONL files processed in Step 1. Only used in LLM evaluation
 | `dataset.parquet_path` | The parquet path  consists of different Parquet files files processed in Step 1. Only used in LCM evaluation
-| `dataset.source_column` | The column in the data that refers to the input embedding. Not applicable when evaluating LLMs
-| `dataset.source_text_column` | The column in the data that refers to the input text. Not applicable  when evaluating LCMs
-| `dataset.source_text_column` | The column in the data that refers to the input text. Not applicable  when evaluating LCMs
-| `dataset.target_column` | The column in the data that refers to the ground-truth embedding. Not applicable  when evaluating LLMs
-| `dataset.target_text_column` | The column in the data that refers to the ground-truth text. Not applicable  when evaluating LCMs
+| `dataset.source_column` | The column in the data that refers to the input embedding. Not applicable when evaluating LLMs.
+| `dataset.source_text_column` | The column in the data that refers to the input text.
+| `dataset.target_column` | The column in the data that refers to the ground-truth embedding. Not applicable when evaluating LLMs.
+| `dataset.target_text_column` | The column in the data that refers to the ground-truth text.
 | `dataset.source_text_prefix` | The text that will prepended to each input text to make the prompt for the model.
-| `dataset.source_text_prefix` | The text that will appended after each input text to make the prompt for the model.
+| `dataset.source_text_suffix` | The text that will appended after each input text to make the prompt for the model.
 | `task_args` | The JSON-formatted string that represents the task arguments. See [task param list](#task_param_list) below.
 | `dump_dir` | The directory consisting output of the eval run. If successful, there should be a file `metrics.eval.jsonl` that consists of metric results, the directory `results` that capture the verbose command line used with the detailed output scores, and the directory `raw_results` that shows
 the model output for each individual sample, together with the per-sample metric results.
@@ -213,7 +236,7 @@ shards=NUMBER_OF_SLURM_NODES
 timeout_min=JOB_TIMEOUT_IN_MINUTES
 
 
-python -m lcm.evaluation \
+uv run -m lcm.evaluation \
   --predictor two_tower_diffusion_lcm  \
   --model_card path/to/the/model_card.yaml \
   --generator_batch_size 16 \
